@@ -1,0 +1,6 @@
+streamlit
+pandas
+playwright
+nest_asyncio
+plotly
+openpyxl
