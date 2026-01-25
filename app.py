@@ -4,31 +4,41 @@ import re
 import datetime
 import os
 import sys
+import subprocess
 import streamlit as st
 import nest_asyncio
 import plotly.express as px
+import io
 from playwright.async_api import async_playwright
 
-# Inisialisasi nest_asyncio untuk Streamlit
+# 1. KONFIGURASI LINGKUNGAN & AUTO-INSTALLER
 nest_asyncio.apply()
 
-# Pastikan folder hasil tersedia
-if not os.path.exists("hasil"):
-    os.makedirs("hasil")
+def install_playwright_browsers():
+    """Menginstal browser Chromium jika belum ada di server."""
+    try:
+        st.info("Sedang menyiapkan browser di server, mohon tunggu sebentar (hanya dilakukan satu kali)...")
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        subprocess.run([sys.executable, "-m", "playwright", "install-deps"], check=True)
+        st.success("Browser berhasil disiapkan!")
+    except Exception as e:
+        st.error(f"Gagal menginstal browser: {e}")
 
-# Konfigurasi Loop untuk Windows
+# Cek folder cache Playwright (path standar di Streamlit Cloud)
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    install_playwright_browsers()
+
+# Konfigurasi Loop untuk Windows (Local Testing)
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-
 # ==============================================================================
-# FUNGSI HELPER
+# 2. FUNGSI HELPER (CLEANING DATA)
 # ==============================================================================
 def clean_price(price_str):
     if not price_str or price_str == "N/A": return 0
     clean = re.sub(r'[^0-9,]', '', price_str)
     return int(clean.split(',')[0]) if clean else 0
-
 
 def clean_terjual(text):
     if not text or "Terjual" not in text: return 0
@@ -42,35 +52,34 @@ def clean_terjual(text):
         num *= 1000000
     return int(num)
 
-
 # ==============================================================================
-# ENGINE SCRAPER
+# 3. ENGINE SCRAPER (ASYNC)
 # ==============================================================================
 async def run_scraper(url_target, metric_places, placeholder_chart, placeholder_table):
     all_results_dict = {}
 
     async with async_playwright() as p:
-        # Launch browser (headless=True wajib untuk server)
+        # Gunakan Chromium (Browser yang paling stabil untuk scraping)
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
         try:
-            st.toast("Membuka katalog...")
+            st.toast("Menghubungkan ke Inaproc...")
             await page.goto(url_target, wait_until="networkidle", timeout=90000)
 
             page_num = 1
             while True:
-                st.sidebar.markdown(f"### 📑 Status: Memproses Hal. {page_num}")
+                st.sidebar.markdown(f"### 📑 Memproses Halaman: {page_num}")
 
-                # Scroll untuk memicu lazy loading
+                # Scroll perlahan untuk memicu loading data (Lazy Load)
                 for _ in range(5):
                     await page.mouse.wheel(0, 1000)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.6)
 
-                # Ekstraksi Data
+                # Ekstraksi Data via JavaScript
                 current_page_data = await page.evaluate("""
                     () => {
                         const results = [];
@@ -94,6 +103,7 @@ async def run_scraper(url_target, metric_places, placeholder_chart, placeholder_
                     }
                 """)
 
+                # Proses dan Simpan Data Unik
                 for item in current_page_data:
                     if item['Link'] not in all_results_dict:
                         item['Harga'] = clean_price(item['Harga_Raw'])
@@ -101,56 +111,59 @@ async def run_scraper(url_target, metric_places, placeholder_chart, placeholder_
                         item['Omzet'] = item['Harga'] * item['Terjual']
                         all_results_dict[item['Link']] = item
 
-                # Update Dashboard Real-time
+                # Update Dashboard Secara Real-time
                 if all_results_dict:
                     df_now = pd.DataFrame(list(all_results_dict.values()))
                     st.session_state.df_scrape = df_now
-
+                    
                     metric_places[0].metric("Total Produk", f"{len(df_now)}")
                     metric_places[1].metric("Total Terjual", f"{df_now['Terjual'].sum():,}")
                     metric_places[2].metric("Estimasi Omzet", f"Rp {df_now['Omzet'].sum():,}")
 
                     df_sorted = df_now.sort_values(by="Omzet", ascending=False)
-                    fig = px.bar(df_sorted.head(10).sort_values("Omzet"), x="Omzet", y="Nama Produk",
-                                 orientation='h', color="Omzet", color_continuous_scale="Viridis")
-                    placeholder_chart.plotly_chart(fig, use_container_width=True, key=f"c_{page_num}")
-                    placeholder_table.dataframe(df_sorted[["Nama Produk", "Harga", "Terjual", "Omzet"]],
+                    fig = px.bar(df_sorted.head(10).sort_values("Omzet"), x="Omzet", y="Nama Produk", 
+                                 orientation='h', color="Omzet", color_continuous_scale="Reds")
+                    placeholder_chart.plotly_chart(fig, use_container_width=True, key=f"chart_{page_num}")
+                    placeholder_table.dataframe(df_sorted[["Nama Produk", "Harga", "Terjual", "Omzet"]], 
                                                 use_container_width=True, height=400)
 
-                # Navigasi ke halaman berikutnya
+                # Logika Pindah Halaman
                 next_btn = page.locator("li.ant-pagination-next, .Pagination_chevron__3Mnyu").last
                 if await next_btn.is_visible():
-                    is_disabled = await next_btn.evaluate(
-                        "n => n.classList.contains('ant-pagination-disabled') || n.getAttribute('aria-disabled') === 'true'")
-                    if is_disabled: break
-
+                    is_disabled = await next_btn.evaluate("n => n.classList.contains('ant-pagination-disabled') || n.getAttribute('aria-disabled') === 'true'")
+                    if is_disabled:
+                        st.sidebar.success("🏁 Mencapai halaman terakhir.")
+                        break
+                    
                     await next_btn.click(force=True)
                     page_num += 1
                     await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(4)
                 else:
                     break
 
         except Exception as e:
-            st.error(f"Terjadi kesalahan: {e}")
+            st.error(f"Terjadi kendala saat scraping: {e}")
         finally:
             await browser.close()
 
-
 # ==============================================================================
-# UI INTERFACE
+# 4. UI INTERFACE (STREAMLIT)
 # ==============================================================================
 def main():
-    st.set_page_config(page_title="Inaproc Analytics", layout="wide")
-
+    st.set_page_config(page_title="Inaproc Market Intelligence", layout="wide", page_icon="📈")
+    
     if 'df_scrape' not in st.session_state:
         st.session_state.df_scrape = pd.DataFrame()
 
     st.markdown("<h2 style='color:#FF4B4B;'>📈 Inaproc Market Intelligence</h2>", unsafe_allow_html=True)
+    st.caption("Aplikasi ini membantu memantau omzet produk dari katalog Inaproc secara otomatis.")
 
-    url_input = st.sidebar.text_input("URL Katalog:", value="https://katalog.inaproc.id/b-braun-medical-indonesia-7pol")
-    start_btn = st.sidebar.button("🚀 Mulai Scrape", use_container_width=True)
+    # Sidebar Kontrol
+    url_input = st.sidebar.text_input("Masukkan URL Katalog Inaproc:", value="https://katalog.inaproc.id/b-braun-medical-indonesia-7pol")
+    start_btn = st.sidebar.button("🚀 Mulai Ambil Data", use_container_width=True)
 
+    # Slot Dashboard
     m1, m2, m3 = st.columns(3)
     metrics = [m1.empty(), m2.empty(), m3.empty()]
     st.divider()
@@ -160,27 +173,23 @@ def main():
     table_p = c_right.empty()
 
     if start_btn:
-        st.session_state.df_scrape = pd.DataFrame()  # Reset data
+        st.session_state.df_scrape = pd.DataFrame() # Reset data lama
         asyncio.run(run_scraper(url_input, metrics, chart_p, table_p))
-
-        # Opsi Download setelah selesai
+        
+        # Sediakan Tombol Download Setelah Selesai
         if not st.session_state.df_scrape.empty():
-            st.sidebar.success("✅ Scraping Selesai!")
             df_final = st.session_state.df_scrape.sort_values("Omzet", ascending=False)
-
-            # Export ke Excel Memory Buffer
-            import io
+            
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df_final.to_excel(writer, index=False)
-
+            
             st.sidebar.download_button(
-                label="📥 Download Hasil (.xlsx)",
+                label="📥 Download Data Excel",
                 data=buffer.getvalue(),
-                file_name=f"inaproc_data_{datetime.date.today()}.xlsx",
+                file_name=f"hasil_scrape_{datetime.date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-
 
 if __name__ == "__main__":
     main()
