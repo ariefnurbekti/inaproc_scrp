@@ -14,3 +14,8 @@ libxi6
 libxrandr2
 libxrender1
 libxtst6
+libpango-1.0-0
+libwayland-client0
+libwayland-cursor0
+libwayland-egl1
+libxkbcommon0
