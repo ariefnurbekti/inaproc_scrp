@@ -4,162 +4,190 @@ import re
 import datetime
 import os
 import sys
-import subprocess
 import streamlit as st
 import nest_asyncio
 import plotly.express as px
-import io
 from playwright.async_api import async_playwright
 
-# 1. SETUP LINGKUNGAN
+# Konfigurasi Loop
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 nest_asyncio.apply()
 
-if 'df_scrape' not in st.session_state:
-    st.session_state.df_scrape = pd.DataFrame()
-
-def install_playwright():
-    try:
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        subprocess.run([sys.executable, "-m", "playwright", "install-deps"], check=True)
-    except:
-        pass
-
-if sys.platform != "win32":
-    install_playwright()
 
 # ==============================================================================
-# 2. DATA CLEANING UTILITIES
+# FUNGSI HELPER
 # ==============================================================================
-def clean_price(text):
-    try:
-        match = re.search(r'Rp\s?([\d.,]+)', text)
-        if match:
-            num_str = match.group(1).replace('.', '').replace(',', '')
-            return int(num_str)
-        return 0
-    except: return 0
+def clean_price(price_str):
+    if not price_str or price_str == "N/A": return 0
+    clean = re.sub(r'[^0-9,]', '', price_str)
+    return int(clean.split(',')[0]) if clean else 0
+
 
 def clean_terjual(text):
-    try:
-        if "Terjual" not in text: return 0
-        val_str = text.split('Terjual')[-1].strip().lower()
-        num = re.findall(r"[\d.,]+", val_str)
-        if not num: return 0
-        val = float(num[0].replace(',', '.'))
-        if 'rb' in val_str: val *= 1000
-        elif 'jt' in val_str: val *= 1000000
-        return int(val)
-    except: return 0
+    if not text or "Terjual" not in text: return 0
+    val_str = text.replace('Terjual', '').strip().lower()
+    numeric_part = re.search(r'[\d.,]+', val_str)
+    if not numeric_part: return 0
+    num = float(numeric_part.group().replace(',', '.'))
+    if 'rb' in val_str:
+        num *= 1000
+    elif 'jt' in val_str:
+        num *= 1000000
+    return int(num)
+
 
 # ==============================================================================
-# 3. ENGINE SCRAPER (STEALTH MODE)
+# ENGINE SCRAPER (OPTIMIZED FOR ALL PAGES)
 # ==============================================================================
-async def run_scraper(url_target, metrics, table_p):
+async def run_scraper(url_target, metric_places, placeholder_chart, placeholder_table):
+    FOLDER_PENYIMPANAN = "hasil"
+    all_results_dict = {}
+
     async with async_playwright() as p:
-        # Gunakan user agent browser asli untuk menghindari blokir
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={'width': 1366, 'height': 768}
-        )
+        # Gunakan slow_mo untuk kestabilan ekstra
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
 
         try:
-            st.toast("Sedang membuka Inaproc (Mode Stealth)...")
-            # Menunggu 'load' saja, bukan networkidle agar tidak timeout
-            response = await page.goto(url_target, wait_until="load", timeout=90000)
-            
-            # Cek jika diblokir
-            if response.status == 403 or response.status == 404:
-                st.error(f"Akses Ditolak (Status {response.status}). Inaproc memblokir koneksi dari server ini.")
-                return
+            st.toast("Membuka katalog...")
+            await page.goto(url_target, wait_until="networkidle", timeout=90000)
 
-            all_data = {}
             page_num = 1
-            
-            while page_num <= 10:
-                st.sidebar.info(f"🔍 Memindai Halaman {page_num}...")
-                
-                # Tunggu minimal 5 detik agar konten sempat dimuat
-                await asyncio.sleep(5)
-                
-                # Ambil semua teks dari link
-                cards = await page.query_selector_all("a")
-                
-                found_on_page = 0
-                for card in cards:
-                    try:
-                        text = await card.inner_text()
-                        link = await card.get_attribute("href")
-                        
-                        if text and "Rp" in text and link and "/product/" in link:
-                            if link not in all_data:
-                                harga = clean_price(text)
-                                terjual = clean_terjual(text)
-                                lines = [l.strip() for l in text.split('\n') if l.strip()]
-                                
-                                all_data[link] = {
-                                    "Nama Produk": lines[0] if lines else "N/A",
-                                    "Harga": harga,
-                                    "Terjual": terjual,
-                                    "Omzet": harga * terjual,
-                                    "Link": link if link.startswith('http') else f"https://katalog.inaproc.id{link}"
+            retry_no_data = 0  # Counter untuk mencoba lagi jika data kosong
+
+            while True:
+                st.sidebar.markdown(f"### 📑 Status: Memproses Hal. {page_num}")
+
+                # 1. SCROLL LEBIH DALAM (PENTING)
+                # Scroll berkali-kali ke bawah untuk memicu semua data muncul
+                for _ in range(6):
+                    await page.mouse.wheel(0, 1200)
+                    await asyncio.sleep(0.7)
+
+                # 2. EKSTRAKSI DATA
+                current_page_data = await page.evaluate("""
+                    () => {
+                        const results = [];
+                        document.querySelectorAll('a').forEach(card => {
+                            const text = card.innerText || "";
+                            if (text.includes('Rp') && text.length > 50) {
+                                const lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+                                const hargaIdx = lines.findIndex(l => l.includes('Rp'));
+                                if (hargaIdx !== -1) {
+                                    results.push({
+                                        "Nama Produk": lines[hargaIdx - 1] || "N/A",
+                                        "Harga_Raw": lines[hargaIdx] || "N/A",
+                                        "Nama Penjual": lines[hargaIdx + 4] || "Unknown",
+                                        "Terjual_Raw": lines.find(l => l.includes('Terjual')) || "0",
+                                        "Link": card.href
+                                    });
                                 }
-                                found_on_page += 1
-                    except: continue
+                            }
+                        });
+                        return results;
+                    }
+                """)
 
-                # Update UI Dashboard
-                if all_data:
-                    df = pd.DataFrame(list(all_data.values()))
-                    st.session_state.df_scrape = df
-                    metrics[0].metric("Produk Ditemukan", len(df))
-                    metrics[1].metric("Total Estimasi Omzet", f"Rp {df['Omzet'].sum():,}")
-                    table_p.dataframe(df.sort_values("Omzet", ascending=False), use_container_width=True)
+                # Masukkan data ke dictionary
+                new_items_count = 0
+                for item in current_page_data:
+                    if item['Link'] not in all_results_dict:
+                        item['Harga'] = clean_price(item['Harga_Raw'])
+                        item['Terjual'] = clean_terjual(item['Terjual_Raw'])
+                        item['Omzet'] = item['Harga'] * item['Terjual']
+                        all_results_dict[item['Link']] = item
+                        new_items_count += 1
 
-                if found_on_page == 0:
-                    st.warning("Tidak menemukan produk di halaman ini. Mencoba scroll...")
-                    await page.evaluate("window.scrollBy(0, 1000)")
-                    await asyncio.sleep(2)
+                # UPDATE DASHBOARD
+                if all_results_dict:
+                    df_now = pd.DataFrame(list(all_results_dict.values()))
+                    st.session_state.df_scrape = df_now
+                    metric_places[0].metric("Total Produk", f"{len(df_now)}")
+                    metric_places[1].metric("Total Terjual", f"{df_now['Terjual'].sum():,}")
+                    metric_places[2].metric("Estimasi Omzet", f"Rp {df_now['Omzet'].sum():,}")
 
-                # Navigasi Halaman
-                next_btn = page.locator("li.ant-pagination-next").last
+                    df_sorted = df_now.sort_values(by="Omzet", ascending=False)
+                    fig = px.bar(df_sorted.head(10).sort_values("Omzet"), x="Omzet", y="Nama Produk", orientation='h',
+                                 color="Omzet", color_continuous_scale="Viridis")
+                    placeholder_chart.plotly_chart(fig, use_container_width=True, key=f"c_{page_num}")
+                    placeholder_table.dataframe(df_sorted[["Nama Produk", "Harga", "Terjual", "Omzet"]],
+                                                use_container_width=True, height=400, key=f"t_{page_num}")
+
+                # 3. LOGIKA NAVIGASI DENGAN TUNGGU EKSTRA
+                next_btn = page.locator("li.ant-pagination-next, .Pagination_chevron__3Mnyu").last
+
                 if await next_btn.is_visible():
-                    is_disabled = await next_btn.evaluate("n => n.classList.contains('ant-pagination-disabled') || n.getAttribute('aria-disabled') === 'true'")
-                    if is_disabled: break
-                    await next_btn.click(force=True)
-                    page_num += 1
+                    # Cek apakah tombol benar-benar mati
+                    is_disabled = await next_btn.evaluate("""
+                        n => n.classList.contains('ant-pagination-disabled') || 
+                             n.getAttribute('aria-disabled') === 'true' || 
+                             n.parentElement.classList.contains('ant-pagination-disabled')
+                    """)
+
+                    if is_disabled:
+                        # Jika terdeteksi mati, kita tunggu 3 detik lalu cek ulang (antisipasi lag)
+                        await asyncio.sleep(3)
+                        is_still_disabled = await next_btn.evaluate(
+                            "n => n.classList.contains('ant-pagination-disabled') || n.parentElement.classList.contains('ant-pagination-disabled')")
+                        if is_still_disabled:
+                            st.sidebar.success("🏁 Selesai! Halaman terakhir tercapai.")
+                            break
+
+                    # Klik dan tunggu muat sempurna
+                    try:
+                        await next_btn.click(force=True)
+                        page_num += 1
+                        st.toast(f"Memuat halaman {page_num}...")
+                        # Tunggu hingga network sepi (menandakan data baru sudah masuk)
+                        await page.wait_for_load_state("networkidle")
+                        await asyncio.sleep(4)  # Waktu aman tambahan
+                    except:
+                        break
                 else:
-                    break
+                    # Jika tombol tidak ada, mungkin karena lag. Tunggu sebentar.
+                    await asyncio.sleep(3)
+                    if not await next_btn.is_visible(): break
 
         except Exception as e:
-            st.error(f"Koneksi Gagal: {e}")
+            st.error(f"Error: {e}")
         finally:
+            if all_results_dict:
+                df_final = pd.DataFrame(list(all_results_dict.values()))
+                raw_name = df_final['Nama Penjual'].iloc[0] if not df_final.empty else "Data"
+                clean_name = re.sub(r'[^\w\s-]', '', raw_name).strip().replace(' ', '_')
+                file_name = f"hasil/{clean_name}_{datetime.datetime.now().strftime('%d-%m-%Y')}.xlsx"
+                df_final.sort_values("Omzet", ascending=False).to_excel(file_name, index=False)
+                st.sidebar.success(f"💾 File Disimpan: {file_name}")
             await browser.close()
 
+
 # ==============================================================================
-# 4. DASHBOARD UI
+# UI INTERFACE
 # ==============================================================================
 def main():
-    st.set_page_config(page_title="Inaproc Intelligence", layout="wide")
-    st.title("📊 Inaproc Market Intelligence")
+    st.set_page_config(page_title="Inaproc Analytics", layout="wide")
+    if 'df_scrape' not in st.session_state: st.session_state.df_scrape = pd.DataFrame()
 
-    url_input = st.sidebar.text_input("URL Katalog:", "https://katalog.inaproc.id/jayamas-medica-industri")
+    st.markdown("<h2 style='color:#FF4B4B;'>📈 Inaproc Market Intelligence</h2>", unsafe_allow_html=True)
+
+    url_input = st.sidebar.text_input("URL Katalog:", value="https://katalog.inaproc.id/b-braun-medical-indonesia-7pol")
     start_btn = st.sidebar.button("🚀 Mulai Scrape", use_container_width=True)
 
-    m1, m2 = st.columns(2)
-    metrics = [m1.empty(), m2.empty()]
+    m1, m2, m3 = st.columns(3)
+    metrics = [m1.empty(), m2.empty(), m3.empty()]
     st.divider()
-    table_p = st.empty()
+
+    c_left, c_right = st.columns([1, 1.2])
+    chart_p = c_left.empty()
+    table_p = c_right.empty()
 
     if start_btn:
         st.session_state.df_scrape = pd.DataFrame()
-        asyncio.run(run_scraper(url_input, metrics, table_p))
+        asyncio.run(run_scraper(url_input, metrics, chart_p, table_p))
 
-    if not st.session_state.df_scrape.empty:
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            st.session_state.df_scrape.to_excel(writer, index=False)
-        st.sidebar.download_button("📥 Download Excel", buffer.getvalue(), "data.xlsx", use_container_width=True)
 
 if __name__ == "__main__":
     main()
